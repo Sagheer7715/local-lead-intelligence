@@ -1,0 +1,74 @@
+# Tier 3 ONLY — the optional Google Maps pass for ratings and review counts.
+#
+# `docker compose up` does not start this. It sits behind a profile, because the
+# default pipeline (Tier 1 OpenStreetMap discovery + Tier 2 website enrichment)
+# needs no container at all. Start it deliberately when you want ratings:
+#
+#     docker compose --profile tier3 up -d
+#     docker compose --profile tier3 down
+#
+# Why the hardening below: this container runs a full Chromium that browses
+# attacker-chosen websites, the upstream image runs as root (verified — the
+# v1.18.1 image config carries no USER), and the engine ships no authentication
+# of any kind.
+
+services:
+  gmaps-engine:
+    profiles: ["tier3"]
+
+    # Pinned by DIGEST, not tag. A tag is a mutable pointer; a digest is the
+    # artifact. This is the multi-platform index for v1.18.1, so it resolves
+    # natively on both amd64 and Apple Silicon.
+    #
+    # Do NOT add `platform: linux/amd64`. The index publishes a real linux/arm64
+    # manifest, so forcing amd64 would run Chromium under QEMU for no reason.
+    image: gosom/google-maps-scraper@sha256:e205c02913c5a69c16fc2094b8e5b194a2f655166d2c1126d50548d216e6b1b2
+
+    container_name: lli-gmaps-engine
+    restart: "no"          # an opt-in tool, not a service that follows you across reboots
+    command: ["-web", "-data-folder", "/gmapsdata"]
+
+    ports:
+      # Localhost only. The engine has no auth, so this binding is load-bearing.
+      # Never change it to 0.0.0.0 without an authenticating proxy in front.
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      # A bind mount, deliberately — and nothing is mounted over /opt.
+      #
+      # The image bakes its Playwright driver and Chromium into /opt
+      # (PLAYWRIGHT_DRIVER_PATH=/opt/ms-playwright-go,
+      #  PLAYWRIGHT_BROWSERS_PATH=/opt/browsers). A named volume mounted there
+      # captures those files when the volume is first created and then shadows
+      # the image forever, so a later image bump keeps serving the OLD driver.
+      # That is why the reference kit's documented fix for its driver-404 bug
+      # (`docker compose pull && up -d`) cannot actually fix it.
+      - ./data/engine:/gmapsdata
+
+    tmpfs:
+      - /tmp:size=512m,mode=1777   # Chromium needs a writable /tmp
+
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2.0
+
+    networks: [engine_net]
+
+    # ── verify, then enable ────────────────────────────────────────────────
+    # Both are genuine hardening and both can break this specific image. They
+    # are commented out because they have not been run against a live
+    # container; turn them on and smoke-test a depth-1 job before trusting them.
+    #
+    #   read_only: true        # Chromium may need writes outside /tmp
+    #   user: "10001:10001"    # requires ./data/engine to be chowned to match
+
+networks:
+  engine_net:
+    driver: bridge
+    # Its own bridge, so a compromised browser cannot reach other containers on
+    # the default network. It can still reach the internet and, on Docker
+    # Desktop, the host gateway — which is exactly why core/safe_fetch.py, and
+    # not this network, is the real boundary for untrusted URLs.

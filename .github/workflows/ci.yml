@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # No install step: the project has no dependencies, which is itself a
+      # security property. Keep it that way.
+      - name: Security guards (SSRF, output escaping)
+        run: python3 -I tests/test_security.py
+      - name: Core (config, storage, exporters)
+        run: python3 -I tests/test_core.py

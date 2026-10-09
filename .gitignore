@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Everything derived: the database, the engine's bind mount, exports.
+# These hold personal data and must never be committed.
+data/
+*.csv
+*.xlsx
+*.json
+!examples/*.json
+!.github/**/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
