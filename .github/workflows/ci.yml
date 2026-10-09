@@ -22,3 +22,5 @@ jobs:
         run: python3 -I tests/test_security.py
       - name: Core (config, storage, exporters)
         run: python3 -I tests/test_core.py
+      - name: Tier 1 (categories, Overpass queries, parsing, phones)
+        run: python3 -I tests/test_tier1.py

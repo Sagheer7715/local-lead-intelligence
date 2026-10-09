@@ -7,8 +7,9 @@ Name a business type and a place; get back a deduplicated, contactable lead list
 with phone, email, website and socials. Everything runs on your machine. No API
 keys, no SaaS, no proxy bill.
 
-> **Status: Phase 1 of 4.** The spine is built and tested (81 tests). Discovery
-> and enrichment land in Phases 2 and 3 — see [Roadmap](#roadmap).
+> **Status: Phase 2 of 4.** Discovery works end to end — a live run returned 119
+> Austin dentists (112 after dedupe) in 6 seconds, free. 143 tests. The
+> enrichment crawl lands in Phase 3 — see [Roadmap](#roadmap).
 
 ## Why it is built this way
 
@@ -69,8 +70,42 @@ Python 3.9+. No dependencies.
 
 ```bash
 cp .env.example .env && chmod 600 .env   # config.py refuses a readable .env
-make test
 ```
+
+Set `LLI_CONTACT_URL` in `.env` to something that reaches you. Overpass and
+Nominatim are donation-funded shared infrastructure and their policies require
+it; the HTTP client refuses to run with the placeholder still in place.
+
+```bash
+python3 cli.py discover "dentists" --in "Austin, Texas, USA"
+python3 cli.py export --out leads.xlsx
+```
+
+```
+▸ Austin, Travis County, Texas, United States (area 3600113314)
+
+[1/1] 'dentists' → dentist
+  119 businesses (121 elements, 2 unnamed and skipped) in 6.1s
+  phone 54 · website 54 · email 16  →  119 new, 0 refreshed
+
+✓ 119 new, 0 refreshed, 16 emails, 8 socials
+  database: 119 rows, 112 unique businesses
+```
+
+Several verticals in one pass, and the other commands:
+
+```bash
+python3 cli.py discover "dentists" "orthodontists" --in "Denver, Colorado, USA"
+python3 cli.py categories                      # what maps to OSM tags
+python3 cli.py stats                           # what is in the database
+python3 cli.py suppress email a@b.com --reason "unsubscribed"
+python3 cli.py purge --days 90 --yes
+make test                                      # 143 offline tests
+```
+
+A place with an administrative boundary is searched by its **exact city
+limits**, not a radius circle — `area(3600113314)` above is Austin's own OSM
+relation. Only a place with no polygon falls back to `--radius`.
 
 Docker is needed **only** for Tier 3, and only when you ask for it:
 
@@ -81,21 +116,27 @@ docker compose --profile tier3 up -d
 ## Layout
 
 ```
+cli.py            discover / export / stats / categories / suppress / purge
 core/
-  safe_fetch.py   the single hardened network chokepoint  (SSRF guard)
+  safe_fetch.py   the single hardened chokepoint for UNTRUSTED urls (SSRF guard)
+  http.py         client for CONFIGURED endpoints: POST, retries, backoff
   sanitize.py     spreadsheet formula neutralization
   config.py       .env loader + typed settings
   db.py           SQLite schema, identity/dedupe, suppression, retention
   export.py       CSV / XLSX / JSON writers, all 0600
-sources/          tier 1 Overpass, tier 3 engine client   (Phase 2/3)
-tests/            81 offline tests
+  phone.py        best-effort E.164, stdlib only
+sources/
+  categories.py   plain language -> OSM tags (66 categories, 162 aliases)
+  geocode.py      Nominatim place -> exact administrative area
+  overpass.py     query building, parsing, storage
+tests/            143 offline tests
 docker-compose.yml  tier 3 only, behind a profile
 ```
 
 ## Roadmap
 
 - [x] **Phase 1 — spine.** SSRF guard, output safety, SQLite schema, config, exporters, CI.
-- [ ] **Phase 2 — Tier 1 discovery.** Overpass queries, geocoding, area resolution. First real lead list.
+- [x] **Phase 2 — Tier 1 discovery.** Overpass queries, exact-boundary geocoding, category mapping, phone normalization, CLI.
 - [ ] **Phase 3 — Tier 2 enrichment.** Cached crawl, email + social extraction, MX validation, quality scoring, robots.txt.
 - [ ] **Phase 4 — surface.** CLI, `purge`/`suppress` commands, Claude Code skill, optional Tier 3 pass.
 
