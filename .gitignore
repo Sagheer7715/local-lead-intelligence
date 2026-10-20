@@ -6,9 +6,11 @@
 data/
 *.csv
 *.xlsx
-*.json
-!examples/*.json
-!.github/**/*.json
+# Root-level JSON only. A blanket *.json also swallowed .claude/settings.json,
+# which is project config that is supposed to ship with the repo.
+/*.json
+leads*.json
+results-*.json
 
 # Python
 __pycache__/

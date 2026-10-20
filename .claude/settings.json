@@ -1,0 +1,25 @@
+{
+  "$comment": "Pre-approves exactly the commands this project runs, and nothing wider. Each entry names the script and subcommand rather than a bare interpreter or a bare 'docker', so an approval here cannot be reused to run something unrelated. Note what is absent: no 'docker compose down -v' (destroys data), no 'purge --yes' and no 'suppress' (both change records), and no plain 'python3' or 'curl'.",
+  "permissions": {
+    "allow": [
+      "Bash(python3 cli.py discover:*)",
+      "Bash(python3 cli.py enrich:*)",
+      "Bash(python3 cli.py export:*)",
+      "Bash(python3 cli.py stats)",
+      "Bash(python3 cli.py categories)",
+      "Bash(python3 cli.py suppress --list)",
+      "Bash(make test)",
+      "Bash(make security)",
+      "Bash(make core)",
+      "Bash(make tier1)",
+      "Bash(make enrich)",
+      "Bash(docker compose --profile tier3 up -d)",
+      "Bash(docker compose --profile tier3 down)",
+      "Bash(docker compose --profile tier3 ps)"
+    ],
+    "deny": [
+      "Bash(docker compose down -v:*)",
+      "Read(./.env)"
+    ]
+  }
+}
