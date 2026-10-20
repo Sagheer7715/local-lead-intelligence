@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core import db, export                                        # noqa: E402
 from core.config import ConfigError, load                          # noqa: E402
-from sources import categories, overpass                           # noqa: E402
+from sources import categories, enrich, overpass                   # noqa: E402
 from sources.geocode import GeocodeError, Geocoder                  # noqa: E402
 
 
@@ -101,6 +101,40 @@ def cmd_discover(args, cfg):
 
 
 # ── export ──────────────────────────────────────────────────────────────────
+
+def cmd_enrich(args, cfg):
+    conn = db.connect(cfg.db_path)
+    todo = enrich.pending(conn, limit=args.limit)
+    if not todo:
+        print("  nothing to enrich — every business with a website already has an "
+              "email, or none have websites yet. Run `discover` first.")
+        return
+    print(f"▸ enriching {len(todo)} business websites "
+          f"({cfg.max_workers} workers, {cfg.per_host_delay}s per host, "
+          f"robots={'on' if cfg.respect_robots else 'OFF'})")
+    print(f"  identifying as {cfg.user_agent}")
+
+    result = enrich.run(cfg, conn, limit=args.limit, workers=args.workers,
+                        check_mx=not args.no_mx)
+
+    print(f"\n✓ {result.emails_found} emails, {result.socials_found} socials "
+          f"in {result.seconds:.0f}s")
+    print(f"  fetched {result.fetched} · cached {result.from_cache} · "
+          f"failed {result.failed}")
+    if result.dead_domains:
+        print(f"  {result.dead_domains} website(s) no longer resolve — dead links in OSM")
+    if result.blocked_by_robots:
+        print(f"  {result.blocked_by_robots} skipped by robots.txt")
+    if result.mx_rejected:
+        print(f"  {result.mx_rejected} addresses dropped — domain has no mail server")
+    if result.refused_by_guard:
+        print(f"  ⚠ {result.refused_by_guard} URL(s) refused by the SSRF guard:")
+        for note in result.guard_blocks:
+            print(f"      {note}")
+    totals = db.counts(conn)
+    print(f"\n  database: {totals['businesses']} businesses, "
+          f"{totals['emails']} emails, {totals['socials']} socials")
+
 
 def cmd_export(args, cfg):
     conn = db.connect(cfg.db_path)
@@ -200,6 +234,13 @@ def main(argv=None):
     d.add_argument("--radius", type=int, default=15000,
                    help="metres, used only if the place has no boundary (default 15000)")
     d.set_defaults(func=cmd_discover)
+
+    n = sub.add_parser("enrich", help="crawl business websites for emails and socials")
+    n.add_argument("--limit", type=int, help="only this many businesses")
+    n.add_argument("--workers", type=int, help="override LLI_MAX_WORKERS")
+    n.add_argument("--no-mx", action="store_true",
+                   help="skip DNS validation of email domains (faster, lower quality)")
+    n.set_defaults(func=cmd_enrich)
 
     e = sub.add_parser("export", help="write the lead list to a file")
     e.add_argument("--out", default="leads.xlsx",

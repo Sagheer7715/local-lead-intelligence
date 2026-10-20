@@ -1,6 +1,6 @@
-.PHONY: test security core tier1 lint clean init
+.PHONY: test security core tier1 enrich lint clean init
 
-test: security core tier1
+test: security core tier1 enrich
 
 security:
 	@python3 -I tests/test_security.py
@@ -10,6 +10,9 @@ core:
 
 tier1:
 	@python3 -I tests/test_tier1.py
+
+enrich:
+	@python3 -I tests/test_enrich.py
 
 init:
 	@test -f .env || (cp .env.example .env && chmod 600 .env && echo "created .env (chmod 600)")

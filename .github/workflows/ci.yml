@@ -24,3 +24,5 @@ jobs:
         run: python3 -I tests/test_core.py
       - name: Tier 1 (categories, Overpass queries, parsing, phones)
         run: python3 -I tests/test_tier1.py
+      - name: Tier 2 (extraction, MX, robots, enrichment)
+        run: python3 -I tests/test_enrich.py

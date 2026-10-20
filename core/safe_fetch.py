@@ -32,7 +32,10 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 ALLOWED_PORTS = frozenset({80, 443})
-MAX_REDIRECTS = 3
+# 5, not 3. A real site routinely chains http -> https -> www -> trailing
+# slash, which is already three hops before any application redirect; the
+# tighter cap was refusing legitimate businesses as if they were hostile.
+MAX_REDIRECTS = 5
 MAX_BYTES = 400_000
 TIMEOUT = 10.0
 USER_AGENT = "local-lead-intelligence/0.1 (+https://example.invalid/bot)"
@@ -68,6 +71,16 @@ _DENY_V6 = tuple(ipaddress.ip_network(n) for n in (
 
 class Blocked(Exception):
     """A URL or redirect hop was refused before any bytes were sent."""
+
+
+class Unresolvable(Blocked):
+    """The host does not exist in DNS.
+
+    A subclass so existing handling still refuses it, but callers can tell it
+    apart. A business whose website died is an ordinary dead link; reporting
+    it as a security refusal alongside a real one teaches people to ignore
+    the warning that matters.
+    """
 
 
 @dataclass(frozen=True)
@@ -137,7 +150,7 @@ def validate(url, *, resolve=socket.getaddrinfo) -> Target:
     try:
         infos = resolve(host, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
-        raise Blocked(f"cannot resolve {host}: {e}") from e
+        raise Unresolvable(f"cannot resolve {host}: {e}") from e
     if not infos:
         raise Blocked(f"no addresses for {host}")
 

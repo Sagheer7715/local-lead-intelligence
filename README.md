@@ -8,7 +8,7 @@ with phone, email, website and socials. Everything runs on your machine. No API
 keys, no SaaS, no proxy bill.
 
 > **Status: Phase 2 of 4.** Discovery works end to end — a live run returned 119
-> Austin dentists (112 after dedupe) in 6 seconds, free. 150 tests. The
+> Austin dentists (112 after dedupe) in 6 seconds, free. 198 tests. The
 > enrichment crawl lands in Phase 3 — see [Roadmap](#roadmap).
 
 ## Why it is built this way
@@ -78,6 +78,7 @@ it; the HTTP client refuses to run with the placeholder still in place.
 
 ```bash
 python3 cli.py discover "dentists" --in "Austin, Texas, USA"
+python3 cli.py enrich                     # crawl their sites for emails + socials
 python3 cli.py export --out leads.xlsx
 ```
 
@@ -100,7 +101,7 @@ python3 cli.py categories                      # what maps to OSM tags
 python3 cli.py stats                           # what is in the database
 python3 cli.py suppress email a@b.com --reason "unsubscribed"
 python3 cli.py purge --days 90 --yes
-make test                                      # 150 offline tests
+make test                                      # 198 offline tests
 ```
 
 A place with an administrative boundary is searched by its **exact city
@@ -125,11 +126,15 @@ core/
   db.py           SQLite schema, identity/dedupe, suppression, retention
   export.py       CSV / XLSX / JSON writers, all 0600
   phone.py        best-effort E.164, stdlib only
+  mx.py           minimal DNS client for MX validation (stdlib only)
+  extract.py      emails + socials from HTML, incl. Cloudflare obfuscation
+  robots.py       robots.txt, fetched through the guard
 sources/
   categories.py   plain language -> OSM tags (66 categories, 162 aliases)
   geocode.py      Nominatim place -> exact administrative area
   overpass.py     query building, parsing, storage
-tests/            150 offline tests
+  enrich.py       cached, throttled, robots-aware crawl
+tests/            198 offline tests
 docker-compose.yml  tier 3 only, behind a profile
 ```
 
@@ -137,8 +142,26 @@ docker-compose.yml  tier 3 only, behind a profile
 
 - [x] **Phase 1 — spine.** SSRF guard, output safety, SQLite schema, config, exporters, CI.
 - [x] **Phase 2 — Tier 1 discovery.** Overpass queries, exact-boundary geocoding, category mapping, phone normalization, CLI.
-- [ ] **Phase 3 — Tier 2 enrichment.** Cached crawl, email + social extraction, MX validation, quality scoring, robots.txt.
+- [x] **Phase 3 — Tier 2 enrichment.** Cached crawl behind the SSRF guard, email + social extraction (incl. Cloudflare-obfuscated addresses), stdlib MX validation, role/personal scoring, robots.txt.
 - [ ] **Phase 4 — surface.** CLI, `purge`/`suppress` commands, Claude Code skill, optional Tier 3 pass.
+
+## What yield to expect
+
+Measured on 433 Austin businesses (dentists, coffee shops, hair salons):
+
+| | |
+|---|---|
+| Businesses discovered | 433 |
+| With a phone (from OSM) | 204 |
+| With a website | 223 |
+| Emails after enrichment | 109 (78 MX-verified) |
+| Social profiles | 295 |
+| **Contactable (phone or email)** | **224 of 433 (52%)** |
+
+Email yield from crawling is about **17% of sites visited**, and that is close
+to the ceiling rather than a defect: sampling the misses showed none of them
+published an address at all — roughly half use a contact form instead. The
+extractor was not missing addresses that were there.
 
 ## Known environment issue: macOS system Python
 
