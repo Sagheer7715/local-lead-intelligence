@@ -18,7 +18,9 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+# 2: dedupe_key now includes location, so chain branches are separate leads.
+#    Databases written under v1 carry keys that merge them and must be re-keyed.
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS businesses (
@@ -138,7 +140,40 @@ def connect(db_path) -> sqlite3.Connection:
     conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
                  (str(SCHEMA_VERSION),))
     conn.commit()
+    _migrate(conn)
     return conn
+
+
+def rekey_all(conn) -> int:
+    """Recompute every dedupe_key with the current rules. Returns rows changed."""
+    changed = 0
+    for row in conn.execute("SELECT * FROM businesses").fetchall():
+        key = dedupe_key(row["name"] or "", row["website"] or "",
+                         row["phone_e164"] or "", row["city"] or "",
+                         row["address"] or "", row["lat"], row["lon"])
+        if key != row["dedupe_key"]:
+            conn.execute("UPDATE businesses SET dedupe_key = ? WHERE id = ?",
+                         (key, row["id"]))
+            changed += 1
+    conn.commit()
+    return changed
+
+
+def _migrate(conn):
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    version = int(row["value"]) if row else SCHEMA_VERSION
+    if version >= SCHEMA_VERSION:
+        return
+    if version < 2:
+        # v1 keyed on domain alone, collapsing every branch of a chain into one
+        # lead. Re-key in place; no data is lost, rows simply regroup.
+        changed = rekey_all(conn)
+        if changed:
+            print(f"  (migrated to schema v2: re-keyed {changed} businesses so "
+                  "chain branches are separate leads)")
+    conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                 (str(SCHEMA_VERSION),))
+    conn.commit()
 
 
 # ── identity ────────────────────────────────────────────────────────────────
@@ -167,19 +202,49 @@ def normalize_domain(website: str) -> str:
     return s[4:] if s.startswith("www.") else s
 
 
-def dedupe_key(name: str, website: str = "", phone_e164: str = "", city: str = "") -> str:
-    """Stable cross-source identity.
+def location_cell(lat=None, lon=None, address: str = "", city: str = "") -> str:
+    """The narrowest location identifier available for a business.
 
-    Domain is the strongest signal, then phone, then name+city. Hashed so the
-    key is fixed-width and carries no PII into indexes or logs.
+    Coordinates come first because every source emits them in the same format,
+    while address strings vary wildly between OSM and anything else.
+
+    Three decimal places is roughly a 110m cell: finer than the gap between two
+    branches of a chain, coarser than the jitter between two mappings of the
+    same building (a node and a building outline).
     """
+    if lat is not None and lon is not None:
+        try:
+            return f"g:{float(lat):.3f},{float(lon):.3f}"
+        except (TypeError, ValueError):
+            pass
+    addr = normalize_name(address)
+    if addr:
+        return "a:" + addr
+    return "c:" + normalize_name(city)
+
+
+def dedupe_key(name: str, website: str = "", phone_e164: str = "", city: str = "",
+               address: str = "", lat=None, lon=None) -> str:
+    """Stable cross-source identity for one business AT ONE LOCATION.
+
+    Location is part of every key, never a tiebreaker. An earlier version keyed
+    on domain alone, which merged 42 Starbucks branches into a single lead and —
+    worse — merged six unrelated campus cafés that happened to share their
+    landlord's domain. A shared domain is evidence of a shared *operator*, not
+    of being the same business.
+
+    Within a location, domain is still the best cross-source match, then phone,
+    then the name. Hashed so the key is fixed-width and carries no PII into
+    indexes or logs.
+    """
+    cell = location_cell(lat, lon, address, city)
     domain = normalize_domain(website)
     if domain:
-        basis = "d:" + domain
+        basis = "d:" + domain + "|" + cell
     elif phone_e164:
-        basis = "p:" + re.sub(r"\D", "", phone_e164)
+        basis = "p:" + re.sub(r"\D", "", phone_e164) + "|" + cell
     else:
-        basis = "n:" + normalize_name(name) + "|" + normalize_name(city)
+        basis = "n:" + normalize_name(name) + "|" + cell
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
 
 
@@ -208,13 +273,24 @@ def upsert_business(conn, source: str, source_id: str, **fields) -> tuple:
         raise ValueError("name is required")
 
     fields["website_domain"] = normalize_domain(fields.get("website") or "")
-    key = dedupe_key(name, fields.get("website") or "", fields.get("phone_e164") or "",
-                     fields.get("city") or "")
     ts = now()
 
     row = conn.execute(
-        "SELECT id FROM businesses WHERE source = ? AND source_id = ?",
+        "SELECT * FROM businesses WHERE source = ? AND source_id = ?",
         (source, source_id)).fetchone()
+
+    # The key must come from the MERGED record. A later pass that carries only
+    # a rating has no coordinates, and recomputing from the incoming fields
+    # alone would silently re-key the business to a coarser location.
+    merged = dict(row) if row is not None else {}
+    for f in _BIZ_FIELDS:
+        if fields.get(f) not in (None, ""):
+            merged[f] = fields[f]
+    merged["name"] = name
+    key = dedupe_key(merged.get("name") or "", merged.get("website") or "",
+                     merged.get("phone_e164") or "", merged.get("city") or "",
+                     merged.get("address") or "", merged.get("lat"), merged.get("lon"))
+
     if row is None:
         cols = ["source", "source_id", "dedupe_key", "first_seen", "last_seen"]
         vals = [source, source_id, key, ts, ts]

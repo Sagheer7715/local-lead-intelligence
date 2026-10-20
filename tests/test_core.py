@@ -122,6 +122,53 @@ check("different domains -> different keys", lambda: _assert_ne(
 check("phone used when no website", lambda: _assert_eq(
     db.dedupe_key("X", "", "+1 512-555-0101"), db.dedupe_key("X", "", "+15125550101")))
 
+
+def test_chain_branches_are_separate_leads():
+    """42 Starbucks on one domain are 42 leads, not one. Regression test."""
+    a = db.dedupe_key("Starbucks", "https://starbucks.com", lat=30.2672, lon=-97.7431)
+    b = db.dedupe_key("Starbucks", "https://starbucks.com", lat=30.3100, lon=-97.7000)
+    assert a != b, "two branches of a chain collapsed into one lead"
+
+
+def test_different_businesses_sharing_a_landlord_domain_stay_separate():
+    """The campus case: six cafés on housing.utexas.edu are six businesses."""
+    keys = {db.dedupe_key(name, "https://housing.utexas.edu", lat=lat, lon=-97.73)
+            for name, lat in [("Jester Java", 30.283), ("Prufrock's", 30.285),
+                              ("Union Coffee House", 30.287), ("Up and Atom", 30.289)]}
+    assert len(keys) == 4, f"distinct businesses merged: {len(keys)} keys for 4 cafés"
+
+
+def test_same_building_mapped_twice_still_merges():
+    """A node and a building outline for one shop are metres apart, not blocks."""
+    a = db.dedupe_key("Medici Roasting", "https://mediciroasting.com",
+                      lat=30.29341, lon=-97.74102)
+    b = db.dedupe_key("Medici Roasting", "https://mediciroasting.com",
+                      lat=30.29349, lon=-97.74108)
+    assert a == b, "one business mapped two ways produced two leads"
+
+
+def test_cross_source_match_at_one_location_still_merges():
+    a = db.dedupe_key("Joe's Coffee", "http://joescoffee.com/", lat=30.2672, lon=-97.7431)
+    b = db.dedupe_key("Joe Coffee Inc", "https://www.joescoffee.com/about",
+                      lat=30.2672, lon=-97.7431)
+    assert a == b, "same business from two sources did not merge"
+
+
+def test_location_falls_back_when_coordinates_are_missing():
+    assert db.location_cell(None, None, "100 Congress Ave").startswith("a:")
+    assert db.location_cell(None, None, "", "Austin").startswith("c:")
+    assert db.location_cell(30.2672, -97.7431).startswith("g:")
+    assert db.location_cell("bad", "coords", "", "Austin").startswith("c:"), \
+        "non-numeric coordinates were not survived"
+
+
+for fn in (test_chain_branches_are_separate_leads,
+           test_different_businesses_sharing_a_landlord_domain_stay_separate,
+           test_same_building_mapped_twice_still_merges,
+           test_cross_source_match_at_one_location_still_merges,
+           test_location_falls_back_when_coordinates_are_missing):
+    check(fn.__name__.replace("test_", "").replace("_", " "), fn)
+
 print("\ndb — upsert, dedupe, suppression, purge")
 
 
@@ -156,11 +203,15 @@ def test_insert_then_update_preserves_first_seen():
 def test_tier3_pass_adds_rating_without_blanking_contacts():
     conn = _fresh()
     bid, _ = db.upsert_business(conn, "osm", "node/2", name="Cafe", website="http://c.com",
-                                phone_e164="+15125550102")
+                                phone_e164="+15125550102", lat=30.26, lon=-97.74)
+    before = conn.execute("SELECT dedupe_key FROM businesses WHERE id=?", (bid,)).fetchone()[0]
+    # A ratings-only pass carries no coordinates.
     db.upsert_business(conn, "osm", "node/2", name="Cafe", rating=4.7, review_count=812)
     row = conn.execute("SELECT * FROM businesses WHERE id=?", (bid,)).fetchone()
     assert row["rating"] == 4.7 and row["review_count"] == 812, "tier 3 data not stored"
     assert row["phone_e164"] == "+15125550102", "tier 3 pass wiped the phone"
+    assert row["dedupe_key"] == before, \
+        "a partial update re-keyed the business — identity must come from the merged row"
 
 
 def test_export_dedupes_across_sources():
@@ -250,6 +301,41 @@ def test_cascade_delete_removes_children():
     assert left == 0, f"{left} orphaned child rows"
 
 
+def test_v1_database_is_rekeyed_on_open():
+    """A database written before the location fix must regroup, not stay broken."""
+    d = tempfile.mkdtemp()
+    path = Path(d) / "old.db"
+    conn = db.connect(path)
+    for i, (lat, lon) in enumerate([(30.26, -97.74), (30.31, -97.70), (30.35, -97.68)]):
+        db.upsert_business(conn, "osm", f"node/{i}", name="Starbucks",
+                           website="https://starbucks.com", lat=lat, lon=lon)
+    # Force the v1 state: one key for every branch, schema marked as old.
+    conn.execute("UPDATE businesses SET dedupe_key = 'legacy-domain-only'")
+    conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+
+    reopened = db.connect(path)
+    keys = {r[0] for r in reopened.execute("SELECT dedupe_key FROM businesses")}
+    assert len(keys) == 3, f"migration left {len(keys)} keys for 3 branches"
+    assert "legacy-domain-only" not in keys, "stale key survived the migration"
+    version = reopened.execute(
+        "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+    assert version == str(db.SCHEMA_VERSION), f"version not bumped: {version}"
+    assert len(db.export_rows(reopened)) == 3, "export still collapses the branches"
+
+
+def test_migration_is_idempotent():
+    d = tempfile.mkdtemp()
+    path = Path(d) / "x.db"
+    conn = db.connect(path)
+    db.upsert_business(conn, "osm", "node/1", name="Cafe", lat=30.1, lon=-97.1)
+    conn.commit()
+    conn.close()
+    db.connect(path).close()
+    assert db.rekey_all(db.connect(path)) == 0, "re-keying a current database changed rows"
+
+
 def test_name_is_required():
     conn = _fresh()
     try:
@@ -265,6 +351,7 @@ for fn in (test_schema_and_permissions, test_insert_then_update_preserves_first_
            test_suppression_removes_from_export, test_suppressed_domain_survives_a_rescrape,
            test_suppress_rejects_bad_kind, test_purge_keeps_suppression,
            test_purge_rejects_zero, test_cascade_delete_removes_children,
+           test_v1_database_is_rekeyed_on_open, test_migration_is_idempotent,
            test_name_is_required):
     check(fn.__name__.replace("test_", "").replace("_", " "), fn)
 

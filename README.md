@@ -8,7 +8,7 @@ with phone, email, website and socials. Everything runs on your machine. No API
 keys, no SaaS, no proxy bill.
 
 > **Status: Phase 2 of 4.** Discovery works end to end — a live run returned 119
-> Austin dentists (112 after dedupe) in 6 seconds, free. 143 tests. The
+> Austin dentists (112 after dedupe) in 6 seconds, free. 150 tests. The
 > enrichment crawl lands in Phase 3 — see [Roadmap](#roadmap).
 
 ## Why it is built this way
@@ -100,7 +100,7 @@ python3 cli.py categories                      # what maps to OSM tags
 python3 cli.py stats                           # what is in the database
 python3 cli.py suppress email a@b.com --reason "unsubscribed"
 python3 cli.py purge --days 90 --yes
-make test                                      # 143 offline tests
+make test                                      # 150 offline tests
 ```
 
 A place with an administrative boundary is searched by its **exact city
@@ -129,7 +129,7 @@ sources/
   categories.py   plain language -> OSM tags (66 categories, 162 aliases)
   geocode.py      Nominatim place -> exact administrative area
   overpass.py     query building, parsing, storage
-tests/            143 offline tests
+tests/            150 offline tests
 docker-compose.yml  tier 3 only, behind a profile
 ```
 
@@ -139,6 +139,26 @@ docker-compose.yml  tier 3 only, behind a profile
 - [x] **Phase 2 — Tier 1 discovery.** Overpass queries, exact-boundary geocoding, category mapping, phone normalization, CLI.
 - [ ] **Phase 3 — Tier 2 enrichment.** Cached crawl, email + social extraction, MX validation, quality scoring, robots.txt.
 - [ ] **Phase 4 — surface.** CLI, `purge`/`suppress` commands, Claude Code skill, optional Tier 3 pass.
+
+## Known environment issue: macOS system Python
+
+`overpass-api.de` requires TLS 1.3. macOS ships Python linked against LibreSSL
+2.8.3, which cannot negotiate it, so discovery fails there with
+`SSLV3_ALERT_HANDSHAKE_FAILURE`. Check yours:
+
+```bash
+python3 -c "import ssl; print(ssl.OPENSSL_VERSION, ssl.HAS_TLSv1_3)"
+```
+
+`core/http.py` detects that handshake failure and retries through the system
+`curl`, which handles TLS 1.3 and ships on every Mac — so Tier 1 works out of
+the box with no install. The fallback is scoped to configured endpoints only;
+`core/safe_fetch.py` never uses it, because its SSRF guard depends on pinning
+the connection to a validated IP and a second implementation of that path would
+be a second thing to get wrong. Measured against 54 real business sites, 94%
+negotiate TLS 1.2 happily, so the enrichment crawler is unaffected.
+
+A Python built against OpenSSL 1.1.1+ removes the need for the fallback.
 
 ## Responsible use
 

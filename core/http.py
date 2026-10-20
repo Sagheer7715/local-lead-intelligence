@@ -14,11 +14,17 @@ from __future__ import annotations
 import gzip
 import json
 import random
+import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+
+# On Python 3.9 `socket.timeout` is a plain OSError subclass, NOT TimeoutError —
+# they were only unified in 3.10. Catching just TimeoutError lets a read
+# timeout escape as a raw traceback on exactly the interpreter macOS ships.
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, socket.timeout)
 
 MAX_BYTES = 64 * 1024 * 1024        # Overpass answers for a big city get large
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
@@ -49,6 +55,100 @@ class Response:
         return self.body.decode("utf-8", "replace")
 
 
+def _is_handshake_failure(exc) -> bool:
+    text = str(exc)
+    return "HANDSHAKE_FAILURE" in text or "UNSUPPORTED_PROTOCOL" in text
+
+
+def _curl_argv(url, *, method, body, headers, timeout, max_bytes, header_file):
+    """Build the curl command. Factored out so the tests can inspect it.
+
+    The request body goes in on STDIN (`--data-binary @-`), never in argv:
+    argv is world-readable through `ps`, and a query is not something to
+    broadcast to every process on the machine.
+    """
+    argv = ["curl", "-sS", "--proto", "=http,https", "--proto-redir", "=http,https",
+            "--max-time", str(int(timeout)), "--max-filesize", str(max_bytes),
+            "-D", header_file, "-X", method, url]
+    for key, value in headers.items():
+        if key.lower() == "accept-encoding":
+            continue                     # let curl and us agree on identity
+        argv += ["-H", f"{key}: {value}"]
+    if body is not None:
+        argv += ["--data-binary", "@-"]
+    return argv
+
+
+def _curl_request(url, *, method, body, headers, timeout, max_bytes) -> Response:
+    """Fallback transport for endpoints our TLS stack cannot reach.
+
+    macOS ships Python linked against LibreSSL 2.8.3, which cannot do TLS 1.3,
+    and overpass-api.de now requires it. The system curl (SecureTransport +
+    LibreSSL 3.3.6) can, and ships on every Mac.
+
+    Scope is deliberately narrow: this is only for endpoints named in config,
+    and only after a handshake failure. `core.safe_fetch` never comes here —
+    its SSRF guard depends on pinning the connection to a validated IP, and
+    re-implementing that through a subprocess would mean two versions of the
+    security-critical path.
+    """
+    import subprocess
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="r+", suffix=".hdr") as hdr:
+        argv = _curl_argv(url, method=method, body=body, headers=headers,
+                          timeout=timeout, max_bytes=max_bytes, header_file=hdr.name)
+        try:
+            proc = subprocess.run(                       # noqa: S603 — list argv, no shell
+                argv, input=body, capture_output=True,
+                timeout=timeout + 10, shell=False)
+        except FileNotFoundError as e:
+            raise HttpError(0, "curl not found, and this Python cannot do TLS 1.3") from e
+        except subprocess.TimeoutExpired as e:
+            raise HttpError(0, f"{url} timed out via curl") from e
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()[:200]
+            raise HttpError(0, f"{url} unreachable via curl: {detail}")
+        hdr.seek(0)
+        head = hdr.read()
+
+    status, parsed = 0, {}
+    for line in head.splitlines():
+        if line.startswith("HTTP/"):
+            parts = line.split()
+            status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            parsed = {}                                  # reset across redirects
+        elif ":" in line:
+            key, _, value = line.partition(":")
+            parsed[key.strip()] = value.strip()
+    if status in RETRY_STATUSES or status >= 400:
+        raise HttpError(status, parsed.get("Status", "request failed"),
+                        proc.stdout[:2000].decode("utf-8", "replace"))
+    return Response(status, proc.stdout, parsed)
+
+
+def _explain(exc) -> str:
+    """Turn an opaque network error into something actionable.
+
+    A bare `SSLV3_ALERT_HANDSHAKE_FAILURE` tells you nothing. In practice it
+    means one thing here: macOS ships a Python linked against LibreSSL 2.8.3,
+    which cannot do TLS 1.3, and the main Overpass instance now requires it.
+    """
+    text = str(exc)
+    if "HANDSHAKE_FAILURE" in text or "UNSUPPORTED_PROTOCOL" in text:
+        import ssl as _ssl
+        return (f"TLS handshake refused ({_ssl.OPENSSL_VERSION}, "
+                f"TLS1.3={_ssl.HAS_TLSv1_3}). This endpoint likely requires "
+                "TLS 1.3, which macOS's system Python cannot negotiate. Either "
+                "set LLI_OVERPASS_URL to a mirror that accepts TLS 1.2, or run "
+                "on a Python built against OpenSSL 1.1.1+.")
+    if isinstance(exc, (socket.timeout, TimeoutError)) or "timed out" in text:
+        return (f"{text} — the endpoint accepted the connection but did not "
+                "answer in time. Public Overpass mirrors queue under load; "
+                "retry, lower the scope, or try another LLI_OVERPASS_URL.")
+    return text
+
+
 def _sleep_for(attempt: int, retry_after=None) -> float:
     if retry_after:
         try:
@@ -61,7 +161,8 @@ def _sleep_for(attempt: int, retry_after=None) -> float:
 
 
 def request(url, *, method="GET", data=None, headers=None, user_agent,
-            timeout=90.0, retries=3, max_bytes=MAX_BYTES, sleep=time.sleep) -> Response:
+            timeout=90.0, retries=3, max_bytes=MAX_BYTES, sleep=time.sleep,
+            allow_curl_fallback=True) -> Response:
     """One request, with backoff on the statuses that mean "later".
 
     `user_agent` is required, not defaulted. Overpass and Nominatim are free,
@@ -105,10 +206,15 @@ def request(url, *, method="GET", data=None, headers=None, user_agent,
             if e.code not in RETRY_STATUSES or attempt == retries:
                 cls = RateLimited if e.code == 429 else HttpError
                 raise cls(e.code, e.reason, detail) from e
-        except (urllib.error.URLError, TimeoutError) as e:
+        except NETWORK_ERRORS as e:
+            # A handshake failure will not improve on retry — the TLS stack
+            # simply cannot speak to this endpoint. Go straight to curl.
+            if allow_curl_fallback and _is_handshake_failure(e):
+                return _curl_request(url, method=method, body=body, headers=hdrs,
+                                     timeout=timeout, max_bytes=max_bytes)
             last = (0, str(e), "", None)
             if attempt == retries:
-                raise HttpError(0, f"{url} unreachable: {e}") from e
+                raise HttpError(0, f"{url} unreachable: {_explain(e)}") from e
         sleep(_sleep_for(attempt, last[3] if last else None))
 
     status, reason, detail, _ = last            # pragma: no cover — loop always returns
