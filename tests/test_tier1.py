@@ -357,8 +357,67 @@ def test_retry_after_header_is_honoured():
     assert http._sleep_for(0, "garbage") > 0, "fell over on a bad header"
 
 
+def test_curl_transport_gets_the_same_retry_policy():
+    """Where TLS forces the curl path it is the only path, so it must retry.
+
+    A 502 from a public Overpass instance is routine; without this the first
+    one ends the run.
+    """
+    calls, slept = [], []
+    original = http._curl_request
+
+    def flaky(url, **kw):
+        calls.append(url)
+        if len(calls) < 3:
+            raise http.HttpError(502, "Bad Gateway")
+        return http.Response(200, b'{"elements":[]}', {})
+
+    def boom(*a, **kw):                     # force the handshake fallback
+        raise __import__("ssl").SSLError(
+            "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure")
+
+    http._curl_request = flaky
+    real_urlopen = http.urllib.request.urlopen
+    http.urllib.request.urlopen = boom
+    try:
+        r = http.request("https://x.test/", method="POST", data={"q": "1"},
+                         user_agent="t/1 (+https://github.com/example)",
+                         retries=3, sleep=slept.append)
+    finally:
+        http._curl_request = original
+        http.urllib.request.urlopen = real_urlopen
+
+    assert r.status == 200, f"never recovered: {r.status}"
+    assert len(calls) == 3, f"retried {len(calls)} times, expected 3"
+    assert len(slept) == 2 and all(s > 0 for s in slept), f"no backoff between: {slept}"
+
+
+def test_curl_fallback_does_not_burn_an_attempt():
+    """Switching transport should retry immediately, not consume a retry slot."""
+    calls, slept = [], []
+    original = http._curl_request
+    http._curl_request = lambda url, **kw: (calls.append(url),
+                                            http.Response(200, b"{}", {}))[1]
+    real_urlopen = http.urllib.request.urlopen
+
+    def boom(*a, **kw):
+        raise __import__("ssl").SSLError("[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] x")
+
+    http.urllib.request.urlopen = boom
+    try:
+        r = http.request("https://x.test/", user_agent="t/1 (+https://github.com/example)",
+                         retries=0, sleep=slept.append)
+    finally:
+        http._curl_request = original
+        http.urllib.request.urlopen = real_urlopen
+    assert r.status == 200 and len(calls) == 1, "fallback did not fire with retries=0"
+    assert slept == [], f"slept before switching transport: {slept}"
+
+
 for fn in (test_user_agent_is_mandatory, test_backoff_grows_and_is_jittered,
-           test_retry_after_header_is_honoured):
+           test_retry_after_header_is_honoured,
+           test_curl_transport_gets_the_same_retry_policy,
+           test_curl_fallback_does_not_burn_an_attempt):
     check(fn.__name__.replace("test_", "").replace("_", " "), fn)
 
 print(f"\n{PASS} passed, {FAIL} failed\n")

@@ -15,6 +15,7 @@ import gzip
 import json
 import random
 import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -24,7 +25,11 @@ from dataclasses import dataclass
 # On Python 3.9 `socket.timeout` is a plain OSError subclass, NOT TimeoutError —
 # they were only unified in 3.10. Catching just TimeoutError lets a read
 # timeout escape as a raw traceback on exactly the interpreter macOS ships.
-NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, socket.timeout)
+#
+# ssl.SSLError is listed separately because it is not a URLError. urlopen wraps
+# the ones raised while connecting, but one raised later — during the response
+# read — reaches the caller bare.
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError)
 
 MAX_BYTES = 64 * 1024 * 1024        # Overpass answers for a big city get large
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
@@ -122,9 +127,23 @@ def _curl_request(url, *, method, body, headers, timeout, max_bytes) -> Response
             key, _, value = line.partition(":")
             parsed[key.strip()] = value.strip()
     if status in RETRY_STATUSES or status >= 400:
-        raise HttpError(status, parsed.get("Status", "request failed"),
-                        proc.stdout[:2000].decode("utf-8", "replace"))
+        detail = proc.stdout[:2000].decode("utf-8", "replace")
+        raise HttpError(status, _first_meaningful_line(detail) or "request failed", detail)
     return Response(status, proc.stdout, parsed)
+
+
+def _first_meaningful_line(body: str) -> str:
+    """Pull the server's own explanation out of an error page.
+
+    Overpass answers a 502 with a readable markdown page saying it is at
+    capacity. Reporting a bare "HTTP 502: request failed" while holding that
+    text is throwing away the only useful part of the response.
+    """
+    for raw in (body or "").splitlines():
+        line = raw.strip().lstrip("#").strip()
+        if len(line) > 3 and not line.startswith("<"):
+            return line[:160]
+    return ""
 
 
 def _explain(exc) -> str:
@@ -136,7 +155,7 @@ def _explain(exc) -> str:
     """
     text = str(exc)
     if "HANDSHAKE_FAILURE" in text or "UNSUPPORTED_PROTOCOL" in text:
-        import ssl as _ssl
+        _ssl = ssl
         return (f"TLS handshake refused ({_ssl.OPENSSL_VERSION}, "
                 f"TLS1.3={_ssl.HAS_TLSv1_3}). This endpoint likely requires "
                 "TLS 1.3, which macOS's system Python cannot negotiate. Either "
@@ -190,9 +209,20 @@ def request(url, *, method="GET", data=None, headers=None, user_agent,
     hdrs.update(headers or {})
 
     last = None
-    for attempt in range(retries + 1):
+    use_curl = False
+    attempt = 0
+    # A while loop, not `for attempt in range(...)`: switching transport after a
+    # handshake failure must not consume a retry slot, or with retries=0 the
+    # fallback would never actually run.
+    while attempt <= retries:
         req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
         try:
+            if use_curl:
+                # Inside the loop on purpose. Where TLS forces the curl path it
+                # becomes the ONLY path, so it has to get the same backoff —
+                # a 502 from a public Overpass instance is routine.
+                return _curl_request(url, method=method, body=body, headers=hdrs,
+                                     timeout=timeout, max_bytes=max_bytes)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read(max_bytes + 1)
                 if len(raw) > max_bytes:
@@ -206,18 +236,27 @@ def request(url, *, method="GET", data=None, headers=None, user_agent,
             if e.code not in RETRY_STATUSES or attempt == retries:
                 cls = RateLimited if e.code == 429 else HttpError
                 raise cls(e.code, e.reason, detail) from e
+        except HttpError as e:
+            # Raised by the curl transport. Same retry policy as urllib's.
+            last = (e.status, str(e), e.body, None)
+            if e.status not in RETRY_STATUSES or attempt == retries:
+                raise
         except NETWORK_ERRORS as e:
             # A handshake failure will not improve on retry — the TLS stack
-            # simply cannot speak to this endpoint. Go straight to curl.
-            if allow_curl_fallback and _is_handshake_failure(e):
-                return _curl_request(url, method=method, body=body, headers=hdrs,
-                                     timeout=timeout, max_bytes=max_bytes)
+            # simply cannot speak to this endpoint. Switch transport and go
+            # again immediately, without burning an attempt on a sleep.
+            if allow_curl_fallback and not use_curl and _is_handshake_failure(e):
+                use_curl = True
+                continue
             last = (0, str(e), "", None)
             if attempt == retries:
                 raise HttpError(0, f"{url} unreachable: {_explain(e)}") from e
         sleep(_sleep_for(attempt, last[3] if last else None))
+        attempt += 1
 
-    status, reason, detail, _ = last            # pragma: no cover — loop always returns
+    if last is None:                            # pragma: no cover — defensive
+        raise HttpError(0, f"{url}: exhausted retries with no recorded error")
+    status, reason, detail, _ = last
     raise HttpError(status, reason, detail)
 
 

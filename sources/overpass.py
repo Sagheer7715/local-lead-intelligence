@@ -204,7 +204,18 @@ def discover(cfg, term, place: Place, *, radius=15000, client=http) -> Discovery
             "infrastructure — wait a few minutes, or run your own instance "
             "from a Geofabrik extract and set LLI_OVERPASS_URL.") from e
     except http.HttpError as e:
-        raise OverpassError(f"Overpass query failed: {e}") from e
+        if e.status in (502, 504):
+            # The public instance says this itself: it is "intended for
+            # browser-based and human-operated tools". Repeated automated runs
+            # will keep hitting the queue, and more retries only add load.
+            raise OverpassError(
+                f"Overpass is at capacity ({e.status}: {e}). This public endpoint "
+                "is meant for human-operated use, not batch runs. Wait and retry, "
+                "or run your own instance from a Geofabrik extract and point "
+                "LLI_OVERPASS_URL at it — no queue, no limits, no contact needed."
+            ) from e
+        detail = f" — {e.body.strip()[:200]}" if getattr(e, "body", "") else ""
+        raise OverpassError(f"Overpass query failed: {e}{detail}") from e
 
     if "remark" in payload and not payload.get("elements"):
         raise OverpassError(f"Overpass returned: {payload['remark']}")
