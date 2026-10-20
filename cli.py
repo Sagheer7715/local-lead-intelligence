@@ -237,6 +237,12 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
+    except ValueError as e:
+        # Mostly the missing-contact guard in core.http, which is a setup
+        # problem the user can fix — not something to show a traceback for.
+        _die(str(e))
+    except ConfigError as e:
+        _die(str(e))
 
 
 if __name__ == "__main__":
