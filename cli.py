@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core import db, export                                        # noqa: E402
 from core.config import ConfigError, load                          # noqa: E402
-from sources import categories, enrich, overpass                   # noqa: E402
+from sources import categories, enrich, gmaps, overpass            # noqa: E402
 from sources.geocode import GeocodeError, Geocoder                  # noqa: E402
 
 
@@ -136,6 +136,35 @@ def cmd_enrich(args, cfg):
           f"{totals['emails']} emails, {totals['socials']} socials")
 
 
+def cmd_ratings(args, cfg):
+    """Tier 3: the only command that touches Google. Opt-in, twice."""
+    geocoder = Geocoder(cfg)
+    try:
+        place = geocoder.lookup(args.place)
+    except GeocodeError as e:
+        _die(str(e))
+    conn = db.connect(cfg.db_path)
+    if not args.yes:
+        print("⚠ This scrapes Google Maps, which violates their Terms of Service and")
+        print("  can get your IP temporarily rate-limited. It adds ratings and review")
+        print("  counts to businesses you already have; it discovers nothing new.")
+        print(f"\n  Would run: {args.keyword!r} @ {place.name[:60]} depth={args.depth}")
+        print("  Re-run with --yes to proceed.")
+        return
+    try:
+        result = gmaps.run(cfg, conn, args.keyword, place, depth=args.depth,
+                           confirmed=True)
+    except gmaps.Tier3Disabled as e:
+        _die(str(e))
+    except gmaps.Tier3Error as e:
+        _die(str(e))
+    print(f"✓ {result.updated} businesses given ratings "
+          f"({result.scraped} scraped, {result.matched} matched) in {result.seconds:.0f}s")
+    if result.unmatched:
+        print(f"  {len(result.unmatched)} scraped rows matched nothing we hold "
+              f"(e.g. {', '.join(result.unmatched[:3])})")
+
+
 def cmd_export(args, cfg):
     conn = db.connect(cfg.db_path)
     rows = db.export_rows(conn, city=args.city)
@@ -241,6 +270,14 @@ def main(argv=None):
     n.add_argument("--no-mx", action="store_true",
                    help="skip DNS validation of email domains (faster, lower quality)")
     n.set_defaults(func=cmd_enrich)
+
+    t = sub.add_parser("ratings",
+                       help="OPT-IN: add Google ratings to businesses you already have")
+    t.add_argument("keyword", help='the same term you discovered with, e.g. "dentists"')
+    t.add_argument("--in", "--city", dest="place", required=True, help="place to search")
+    t.add_argument("--depth", type=int, default=5, help="scroll depth (start low)")
+    t.add_argument("--yes", action="store_true", help="confirm the Google ToS tradeoff")
+    t.set_defaults(func=cmd_ratings)
 
     e = sub.add_parser("export", help="write the lead list to a file")
     e.add_argument("--out", default="leads.xlsx",

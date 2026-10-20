@@ -8,7 +8,7 @@ with phone, email, website and socials. Everything runs on your machine. No API
 keys, no SaaS, no proxy bill.
 
 > **Status: Phase 2 of 4.** Discovery works end to end — a live run returned 119
-> Austin dentists (112 after dedupe) in 6 seconds, free. 198 tests. The
+> Austin dentists (112 after dedupe) in 6 seconds, free. 213 tests. The
 > enrichment crawl lands in Phase 3 — see [Roadmap](#roadmap).
 
 ## Why it is built this way
@@ -82,6 +82,9 @@ python3 cli.py enrich                     # crawl their sites for emails + socia
 python3 cli.py export --out leads.xlsx
 ```
 
+Or, in Claude Code, just say *"build me a lead list of dentists in Austin"* —
+the `local-leads` skill drives all of it.
+
 ```
 ▸ Austin, Travis County, Texas, United States (area 3600113314)
 
@@ -101,7 +104,7 @@ python3 cli.py categories                      # what maps to OSM tags
 python3 cli.py stats                           # what is in the database
 python3 cli.py suppress email a@b.com --reason "unsubscribed"
 python3 cli.py purge --days 90 --yes
-make test                                      # 198 offline tests
+make test                                      # 213 offline tests
 ```
 
 A place with an administrative boundary is searched by its **exact city
@@ -134,7 +137,9 @@ sources/
   geocode.py      Nominatim place -> exact administrative area
   overpass.py     query building, parsing, storage
   enrich.py       cached, throttled, robots-aware crawl
-tests/            198 offline tests
+  gmaps.py        tier 3 ratings, double-gated and off by default
+.claude/          skill + slash commands for Claude Code
+tests/            213 offline tests
 docker-compose.yml  tier 3 only, behind a profile
 ```
 
@@ -143,7 +148,7 @@ docker-compose.yml  tier 3 only, behind a profile
 - [x] **Phase 1 — spine.** SSRF guard, output safety, SQLite schema, config, exporters, CI.
 - [x] **Phase 2 — Tier 1 discovery.** Overpass queries, exact-boundary geocoding, category mapping, phone normalization, CLI.
 - [x] **Phase 3 — Tier 2 enrichment.** Cached crawl behind the SSRF guard, email + social extraction (incl. Cloudflare-obfuscated addresses), stdlib MX validation, role/personal scoring, robots.txt.
-- [ ] **Phase 4 — surface.** CLI, `purge`/`suppress` commands, Claude Code skill, optional Tier 3 pass.
+- [x] **Phase 4 — surface.** Claude Code skill and slash commands, scoped permissions, opt-in Tier 3 ratings pass.
 
 ## What yield to expect
 
@@ -182,6 +187,28 @@ be a second thing to get wrong. Measured against 54 real business sites, 94%
 negotiate TLS 1.2 happily, so the enrichment crawler is unaffected.
 
 A Python built against OpenSSL 1.1.1+ removes the need for the fallback.
+
+## Tier 3: ratings from Google (opt-in, off)
+
+OSM has no ratings. If you need them to qualify leads, Tier 3 adds them to
+businesses you already have — it discovers nothing. It is gated twice on
+purpose, by `LLI_TIER3_ENABLED=true` in `.env` **and** `--yes` on the command,
+because it scrapes Google Maps in violation of their Terms of Service and
+risks your IP being rate-limited.
+
+```bash
+docker compose --profile tier3 up -d
+python3 cli.py ratings "dentists" --in "Austin, Texas, USA" --yes
+docker compose --profile tier3 down
+```
+
+One job per category rather than one per business, so a city is a handful of
+requests. Scraped rows match existing businesses by normalised name plus real
+distance (haversine, 250m) rather than by dedupe key — Google and OSM routinely
+place the same shop tens of metres apart, enough to straddle a grid cell.
+
+> The engine protocol and matching have 15 offline tests, but the live path has
+> not been exercised against a running container.
 
 ## Responsible use
 

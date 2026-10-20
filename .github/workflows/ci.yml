@@ -26,3 +26,5 @@ jobs:
         run: python3 -I tests/test_tier1.py
       - name: Tier 2 (extraction, MX, robots, enrichment)
         run: python3 -I tests/test_enrich.py
+      - name: Tier 3 (gating, engine protocol, matching)
+        run: python3 -I tests/test_tier3.py
